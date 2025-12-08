@@ -1,0 +1,2 @@
+flask
+alpaca-trade-api>=3.0.0
