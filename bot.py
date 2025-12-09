@@ -1,4 +1,5 @@
 import os
+import time
 from flask import Flask, request, jsonify
 from alpaca_trade_api import REST
 
@@ -90,13 +91,14 @@ def submit_buy(symbol: str):
 
     # 1) Submit the entry order (fractional notional, DAY)
     try:
-        alpaca.submit_order(
+        entry_order = alpaca.submit_order(
             symbol=symbol,
             notional=MAX_POSITION_DOLLARS,
             side="buy",
             type="market",
             time_in_force="day",  # required for fractional orders
         )
+        print("Submitted entry order:", entry_order)
     except Exception as e:
         return {
             "status": "error",
@@ -105,17 +107,27 @@ def submit_buy(symbol: str):
             "error": f"entry order failed: {e}",
         }
 
-    # 2) After entry, refresh position size and price and place a 15% stop-loss
-    qty = get_position_qty(symbol)
-    price = get_last_price(symbol)
+    # 2) Wait briefly for position/price to update, then place a 15% stop-loss
+    qty = 0.0
+    price = None
+
+    # Try up to 5 times, waiting 1 second between each
+    for i in range(5):
+        time.sleep(1)
+        qty = get_position_qty(symbol)
+        price = get_last_price(symbol)
+        print(f"Attempt {i+1}: qty={qty}, price={price}")
+        if qty > 0 and price is not None and price > 0:
+            break
 
     if qty <= 0 or price is None or price <= 0:
+        # Entry worked but we couldn't reliably get qty/price yet
         return {
             "status": "submitted_entry_only",
             "side": "buy",
             "symbol": symbol,
             "notional": MAX_POSITION_DOLLARS,
-            "warning": "could not place stop-loss (no qty or price)",
+            "warning": "could not place stop-loss (no qty or price after retries)",
         }
 
     stop_price = round(price * 0.85, 2)  # 15% below current price
