@@ -18,7 +18,7 @@ if ALPACA_ENV == "paper":
 else:
     ALPACA_BASE_URL = "https://api.alpaca.markets"
 
-# Max dollar size per ticker (fractional notional orders)
+# Max dollar size per trade (fractional notional orders)
 MAX_POSITION_DOLLARS = float(os.getenv("MAX_POSITION_DOLLARS", "500"))
 
 # Optional: whitelist tickers, e.g. "SPY,QQQ,TSLA"
@@ -36,18 +36,21 @@ alpaca = REST(
     base_url=ALPACA_BASE_URL,
 )
 
+# Track active stop-loss order IDs per symbol so we can cancel them on manual SELL
+STOP_ORDERS = {}  # { "SPY": "order_id", ... }
+
 
 # =========================
 # HELPER FUNCTIONS
 # =========================
 
-def is_allowed_symbol(symbol):
+def is_allowed_symbol(symbol: str) -> bool:
     if not ALLOWED_TICKERS:
         return True
     return symbol.upper() in ALLOWED_TICKERS
 
 
-def get_position_qty(symbol):
+def get_position_qty(symbol: str) -> float:
     """Return current position quantity (0 if flat)."""
     try:
         pos = alpaca.get_position(symbol)
@@ -57,8 +60,26 @@ def get_position_qty(symbol):
         return 0.0
 
 
-def submit_buy(symbol):
-    """Submit market BUY using fractional notional orders, capped by MAX_POSITION_DOLLARS."""
+def get_last_price(symbol: str):
+    """Get last traded price from Alpaca, or None on error."""
+    try:
+        trade = alpaca.get_latest_trade(symbol)
+        return float(trade.price)
+    except Exception as e:
+        print("Error getting last price for", symbol, ":", e)
+        return None
+
+
+# =========================
+# ORDER FUNCTIONS
+# =========================
+
+def submit_buy(symbol: str):
+    """
+    Submit market BUY using fractional notional orders,
+    capped by MAX_POSITION_DOLLARS, with a 15% stop-loss.
+    No check against today's open; we trust your indicator for entries.
+    """
     symbol = symbol.upper()
     if not is_allowed_symbol(symbol):
         return {"status": "skipped", "reason": "symbol not allowed", "symbol": symbol}
@@ -67,40 +88,94 @@ def submit_buy(symbol):
     if existing_qty > 0:
         return {"status": "skipped", "reason": "already long", "symbol": symbol, "qty": existing_qty}
 
+    # 1) Submit the entry order (fractional notional, DAY)
     try:
         alpaca.submit_order(
             symbol=symbol,
-            notional=MAX_POSITION_DOLLARS,  # fractional, e.g. $500 worth
+            notional=MAX_POSITION_DOLLARS,
             side="buy",
             type="market",
-            time_in_force="day",           # required for fractional orders
+            time_in_force="day",  # required for fractional orders
         )
-        return {
-            "status": "submitted",
-            "side": "buy",
-            "symbol": symbol,
-            "notional": MAX_POSITION_DOLLARS,
-        }
     except Exception as e:
         return {
             "status": "error",
             "side": "buy",
             "symbol": symbol,
-            "error": str(e),
+            "error": f"entry order failed: {e}",
+        }
+
+    # 2) After entry, refresh position size and price and place a 15% stop-loss
+    qty = get_position_qty(symbol)
+    price = get_last_price(symbol)
+
+    if qty <= 0 or price is None or price <= 0:
+        return {
+            "status": "submitted_entry_only",
+            "side": "buy",
+            "symbol": symbol,
+            "notional": MAX_POSITION_DOLLARS,
+            "warning": "could not place stop-loss (no qty or price)",
+        }
+
+    stop_price = round(price * 0.85, 2)  # 15% below current price
+
+    try:
+        stop_order = alpaca.submit_order(
+            symbol=symbol,
+            qty=qty,                  # match current position size (can be fractional)
+            side="sell",
+            type="stop",
+            stop_price=stop_price,
+            time_in_force="day",
+        )
+        STOP_ORDERS[symbol] = stop_order.id
+        return {
+            "status": "submitted_with_stop",
+            "side": "buy",
+            "symbol": symbol,
+            "notional": MAX_POSITION_DOLLARS,
+            "qty": qty,
+            "entry_price": price,
+            "stop_price": stop_price,
+            "stop_order_id": stop_order.id,
+        }
+    except Exception as e:
+        return {
+            "status": "submitted_entry_only",
+            "side": "buy",
+            "symbol": symbol,
+            "notional": MAX_POSITION_DOLLARS,
+            "qty": qty,
+            "entry_price": price,
+            "stop_error": str(e),
         }
 
 
-def submit_sell(symbol):
-    """Submit market SELL to flatten an existing long position."""
+def submit_sell(symbol: str):
+    """
+    Submit market SELL to flatten an existing long position.
+    Cancels any tracked stop-loss for this symbol.
+    """
     symbol = symbol.upper()
     if not is_allowed_symbol(symbol):
         return {"status": "skipped", "reason": "symbol not allowed", "symbol": symbol}
+
+    # Cancel any existing stop-loss order for this symbol
+    if symbol in STOP_ORDERS:
+        stop_id = STOP_ORDERS[symbol]
+        try:
+            alpaca.cancel_order(stop_id)
+            print(f"Canceled stop-loss order {stop_id} for {symbol}")
+        except Exception as e:
+            print(f"Error canceling stop-loss for {symbol}: {e}")
+        STOP_ORDERS.pop(symbol, None)
 
     existing_qty = get_position_qty(symbol)
     if existing_qty <= 0:
         return {"status": "skipped", "reason": "no long position", "symbol": symbol}
 
-    qty = int(abs(existing_qty))
+    qty = float(existing_qty)
 
     try:
         alpaca.submit_order(
@@ -121,7 +196,7 @@ def submit_sell(symbol):
 
 
 # =========================
-# WEBHOOK ENDPOINT
+# WEB ENDPOINTS
 # =========================
 
 @app.route("/webhook", methods=["POST"])
@@ -129,9 +204,9 @@ def webhook():
     """
     This is the URL TradingView will call.
     Expected JSON:
-    { "ticker": "SPY", "signal": "BUY" }
+      { "ticker": "SPY", "signal": "BUY" }
     or:
-    { "ticker": "SPY", "signal": "SELL" }
+      { "ticker": "SPY", "signal": "SELL" }
     """
     try:
         data = request.get_json(force=True)
@@ -157,7 +232,7 @@ def webhook():
     elif signal == "SELL":
         result = submit_sell(symbol)
     else:
-        return jsonify({"ok": False, "error": "Unknown signal: %s" % signal}), 400
+        return jsonify({"ok": False, "error": f"Unknown signal: {signal}"}), 400
 
     print("Trade result:", result)
     return jsonify({"ok": True, "symbol": symbol, "signal": signal, "result": result}), 200
