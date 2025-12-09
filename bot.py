@@ -18,15 +18,15 @@ if ALPACA_ENV == "paper":
 else:
     ALPACA_BASE_URL = "https://api.alpaca.markets"
 
-# Max dollar size per ticker (change this to your comfort level)
+# Max dollar size per ticker (fractional notional orders)
 MAX_POSITION_DOLLARS = float(os.getenv("MAX_POSITION_DOLLARS", "500"))
 
-# Optional: whitelist tickers you allow the bot to trade, e.g. "SPY,QQQ,TSLA"
+# Optional: whitelist tickers, e.g. "SPY,QQQ,TSLA"
 ALLOWED_TICKERS = os.getenv("ALLOWED_TICKERS", "")
 if ALLOWED_TICKERS:
     ALLOWED_TICKERS = [t.strip().upper() for t in ALLOWED_TICKERS.split(",")]
 else:
-    ALLOWED_TICKERS = []  # means "allow all"
+    ALLOWED_TICKERS = []  # allow all symbols
 
 app = Flask(__name__)
 
@@ -41,13 +41,13 @@ alpaca = REST(
 # HELPER FUNCTIONS
 # =========================
 
-def is_allowed_symbol(symbol: str) -> bool:
+def is_allowed_symbol(symbol):
     if not ALLOWED_TICKERS:
         return True
     return symbol.upper() in ALLOWED_TICKERS
 
 
-def get_position_qty(symbol: str) -> float:
+def get_position_qty(symbol):
     """Return current position quantity (0 if flat)."""
     try:
         pos = alpaca.get_position(symbol)
@@ -57,8 +57,8 @@ def get_position_qty(symbol: str) -> float:
         return 0.0
 
 
-def submit_buy(symbol: str):
-    """Submit market BUY using notional dollars if not already long."""
+def submit_buy(symbol):
+    """Submit market BUY using fractional notional orders, capped by MAX_POSITION_DOLLARS."""
     symbol = symbol.upper()
     if not is_allowed_symbol(symbol):
         return {"status": "skipped", "reason": "symbol not allowed", "symbol": symbol}
@@ -67,21 +67,30 @@ def submit_buy(symbol: str):
     if existing_qty > 0:
         return {"status": "skipped", "reason": "already long", "symbol": symbol, "qty": existing_qty}
 
-    # Use notional instead of calculating share qty from last price
     try:
         alpaca.submit_order(
             symbol=symbol,
-            notional=MAX_POSITION_DOLLARS,
+            notional=MAX_POSITION_DOLLARS,  # fractional, e.g. $500 worth
             side="buy",
             type="market",
-            time_in_force="day",
+            time_in_force="day",           # required for fractional orders
         )
-        return {"status": "submitted", "side": "buy", "symbol": symbol, "notional": MAX_POSITION_DOLLARS}
+        return {
+            "status": "submitted",
+            "side": "buy",
+            "symbol": symbol,
+            "notional": MAX_POSITION_DOLLARS,
+        }
     except Exception as e:
-        return {"status": "error", "side": "buy", "symbol": symbol, "error": str(e)}
+        return {
+            "status": "error",
+            "side": "buy",
+            "symbol": symbol,
+            "error": str(e),
+        }
 
 
-def submit_sell(symbol: str):
+def submit_sell(symbol):
     """Submit market SELL to flatten an existing long position."""
     symbol = symbol.upper()
     if not is_allowed_symbol(symbol):
@@ -103,7 +112,12 @@ def submit_sell(symbol: str):
         )
         return {"status": "submitted", "side": "sell", "symbol": symbol, "qty": qty}
     except Exception as e:
-        return {"status": "error", "side": "sell", "symbol": symbol, "error": str(e)}
+        return {
+            "status": "error",
+            "side": "sell",
+            "symbol": symbol,
+            "error": str(e),
+        }
 
 
 # =========================
@@ -114,16 +128,10 @@ def submit_sell(symbol: str):
 def webhook():
     """
     This is the URL TradingView will call.
-    Expected JSON from TradingView alert:
-    {
-        "ticker": "SPY",
-        "signal": "BUY"
-    }
+    Expected JSON:
+    { "ticker": "SPY", "signal": "BUY" }
     or:
-    {
-        "ticker": "SPY",
-        "signal": "SELL"
-    }
+    { "ticker": "SPY", "signal": "SELL" }
     """
     try:
         data = request.get_json(force=True)
@@ -149,7 +157,7 @@ def webhook():
     elif signal == "SELL":
         result = submit_sell(symbol)
     else:
-        return jsonify({"ok": False, "error": f"Unknown signal: {signal}"}), 400
+        return jsonify({"ok": False, "error": "Unknown signal: %s" % signal}), 400
 
     print("Trade result:", result)
     return jsonify({"ok": True, "symbol": symbol, "signal": signal, "result": result}), 200
