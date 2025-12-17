@@ -4,21 +4,30 @@ import traceback
 from flask import Flask, request, jsonify
 from alpaca_trade_api import REST
 
-# ===== CONFIG =====
-def must(name: str) -> str:
+# =====================
+# CRYPTO-ONLY SCALPER BOT (1m)
+# - Flexible pairs (BTCUSD, BINANCE:SOLUSDT, BTC/USD, etc.)
+# - Market BUY using notional (fractional)
+# - Places TP (limit) + SL (stop_limit) immediately after fill visibility
+# - Tight defaults for 1m: TP 0.6%, SL 0.9%
+# - Rejects unsubstituted TradingView placeholders ({{TICKER}}, {{ticker}}, etc.)
+# - /health endpoint
+# =====================
+
+def must_env(name: str) -> str:
     v = os.getenv(name, "")
     if not v.strip():
         raise RuntimeError(f"Missing env var: {name}")
     return v.strip()
 
-API_KEY = must("ALPACA_API_KEY_ID")
-API_SECRET = must("ALPACA_API_SECRET_KEY")
+API_KEY = must_env("ALPACA_API_KEY_ID")
+API_SECRET = must_env("ALPACA_API_SECRET_KEY")
 ENV = os.getenv("ALPACA_ENV", "paper").strip().lower()
 BASE_URL = "https://paper-api.alpaca.markets" if ENV == "paper" else "https://api.alpaca.markets"
 
 MAX_NOTIONAL = float(os.getenv("MAX_POSITION_DOLLARS", "500"))
 
-# Tight 1m defaults (override with env vars)
+# Tight 1m defaults (override via Render env vars)
 TAKE_PROFIT_PCT = float(os.getenv("TAKE_PROFIT_PCT", "0.006"))        # +0.6%
 STOP_LOSS_PCT = float(os.getenv("STOP_LOSS_PCT", "0.009"))            # -0.9%
 STOP_LIMIT_SLIP = float(os.getenv("STOP_LIMIT_SLIP_PCT", "0.0015"))   # 0.15%
@@ -26,12 +35,22 @@ STOP_LIMIT_SLIP = float(os.getenv("STOP_LIMIT_SLIP_PCT", "0.0015"))   # 0.15%
 alpaca = REST(API_KEY, API_SECRET, BASE_URL)
 app = Flask(__name__)
 
-# track exits per pair
-EXITS = {}  # { "BTC/USD": {"tp": id, "sl": id} }
+# Track exit orders per pair: {"BTC/USD": {"tp": id, "sl": id}}
+EXITS: dict[str, dict[str, str]] = {}
 
-# ===== HELPERS =====
-def normalize(symbol: str) -> str:
-    s = (symbol or "").upper().strip()
+
+# =====================
+# Helpers
+# =====================
+
+def normalize(tv_symbol: str) -> str:
+    """
+    Accepts:
+      "BTCUSD", "ETHUSD", "SOLUSDT", "COINBASE:BTCUSD", "BINANCE:SOLUSDT", "BTC/USD"
+    Returns:
+      "BTC/USD", "SOL/USDT", etc.
+    """
+    s = (tv_symbol or "").upper().strip()
     if ":" in s:
         s = s.split(":", 1)[1]
     if "/" in s:
@@ -42,15 +61,16 @@ def normalize(symbol: str) -> str:
     return f"{s}/USD"
 
 def asset_sym(pair: str) -> str:
+    # Alpaca positions typically show BTCUSD, ETHUSD, etc.
     return pair.replace("/", "")
 
-def qty(pair: str) -> float:
+def get_qty(pair: str) -> float:
     try:
         return float(alpaca.get_position(asset_sym(pair)).qty)
     except Exception:
         return 0.0
 
-def last_price(pair: str) -> float | None:
+def get_price(pair: str) -> float | None:
     try:
         return float(alpaca.get_latest_trade(pair).price)
     except Exception:
@@ -70,7 +90,7 @@ def cancel_exits(pair: str):
             pass
 
 def place_exits(pair: str, position_qty: float, entry: float) -> dict:
-    # Fast take-profit (limit)
+    # Take Profit (limit)
     tp_price = r(entry * (1 + TAKE_PROFIT_PCT))
     tp = alpaca.submit_order(
         symbol=pair,
@@ -81,9 +101,9 @@ def place_exits(pair: str, position_qty: float, entry: float) -> dict:
         limit_price=tp_price,
     )
 
-    # Tight stop-loss (stop_limit)
+    # Stop Loss (stop_limit)
     sl_stop = r(entry * (1 - STOP_LOSS_PCT))
-    sl_limit = r(sl_stop * (1 - STOP_LIMIT_SLIP))  # slightly below stop to improve fills
+    sl_limit = r(sl_stop * (1 - STOP_LIMIT_SLIP))
     sl = alpaca.submit_order(
         symbol=pair,
         side="sell",
@@ -97,13 +117,20 @@ def place_exits(pair: str, position_qty: float, entry: float) -> dict:
     EXITS[pair] = {"tp": tp.id, "sl": sl.id}
     return {"tp": tp_price, "sl": sl_stop}
 
-# ===== ACTIONS =====
+
+# =====================
+# Actions
+# =====================
+
 def do_buy(pair: str) -> dict:
-    if qty(pair) > 0:
+    # Avoid stacking on the same pair
+    if get_qty(pair) > 0:
         return {"status": "skipped", "reason": "already long"}
 
+    # Clean any stale exits
     cancel_exits(pair)
 
+    # Market buy with notional (fractional)
     alpaca.submit_order(
         symbol=pair,
         side="buy",
@@ -112,13 +139,13 @@ def do_buy(pair: str) -> dict:
         notional=MAX_NOTIONAL,
     )
 
-    # minimal wait for fill visibility
+    # Minimal wait for position/price visibility
     q = 0.0
     p = None
-    for _ in range(6):  # ~1.2s
+    for _ in range(6):  # ~1.2s total
         time.sleep(0.2)
-        q = qty(pair)
-        p = last_price(pair)
+        q = get_qty(pair)
+        p = get_price(pair)
         if q > 0 and p:
             exits = place_exits(pair, q, p)
             return {"status": "bought", "qty": q, "entry": p, "exits": exits}
@@ -126,8 +153,10 @@ def do_buy(pair: str) -> dict:
     return {"status": "entry_sent_no_exits"}
 
 def do_sell(pair: str) -> dict:
+    # Cancel exits first to prevent double-sell
     cancel_exits(pair)
-    q = qty(pair)
+
+    q = get_qty(pair)
     if q <= 0:
         return {"status": "skipped", "reason": "no position"}
 
@@ -140,7 +169,11 @@ def do_sell(pair: str) -> dict:
     )
     return {"status": "sold", "qty": q}
 
-# ===== ROUTES =====
+
+# =====================
+# Routes
+# =====================
+
 @app.route("/health", methods=["GET"])
 def health():
     return jsonify({
@@ -156,16 +189,23 @@ def health():
 def webhook():
     try:
         data = request.get_json(force=True) or {}
+        print("RAW PAYLOAD:", data)
+
         ticker = data.get("ticker", "")
         signal = (data.get("signal") or "").upper().strip()
 
         if not ticker or signal not in ("BUY", "SELL"):
             return jsonify({"ok": False, "error": "Bad payload. Need {ticker, signal: BUY|SELL}"}), 400
 
-        if "{{" in str(ticker) or "}}" in str(ticker):
-            return jsonify({"ok": False, "error": "Unsubstituted ticker placeholder. Use {{ticker}}."}), 400
+        ticker_str = str(ticker)
+        # Reject unsubstituted TradingView placeholders like {{ticker}} or {{TICKER}}
+        if "{{" in ticker_str or "}}" in ticker_str:
+            return jsonify({
+                "ok": False,
+                "error": "Ticker placeholder not substituted. In TradingView alert message use {{ticker}} (lowercase)."
+            }), 400
 
-        pair = normalize(ticker)
+        pair = normalize(ticker_str)
 
         res = do_buy(pair) if signal == "BUY" else do_sell(pair)
         return jsonify({"ok": True, "pair": pair, "signal": signal, "result": res}), 200
@@ -175,5 +215,7 @@ def webhook():
         print(tb)
         return jsonify({"ok": False, "error": str(e), "trace": tb[-1500:]}), 500
 
+
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=int(os.getenv("PORT", "8000")))
+    port = int(os.getenv("PORT", "8000"))
+    app.run(host="0.0.0.0", port=port)
