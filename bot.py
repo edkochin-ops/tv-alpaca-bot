@@ -9,14 +9,14 @@ from flask import Flask, request, jsonify
 from alpaca_trade_api import REST
 
 # =========================================================
-# CRYPTO AUTO-TRADER (BTC/ETH/SOL only) — FULLY AUTOMATED
+# FULLY AUTOMATED CRYPTO BOT (BTC / ETH / SOL ONLY)
 # - TradingView webhook -> Alpaca crypto orders
-# - Reliable crypto pricing via Alpaca Data API v1beta3
+# - Uses Alpaca Data API (v1beta3) for crypto price (reliable)
 # - Falls back to TradingView tv_price if needed
+# - Marketable IOC LIMIT entries/exits (slippage-capped)
 # - Daily governors (profit stop / loss stop / max trades / max losers)
-# - Marketable IOC LIMIT entries/exits (caps slippage)
-# - Partial profit taking + stop-loss (stop_limit)
-# - Reconciler keeps stop qty correct after partial fills
+# - Partial profit-taking (TP1/TP2) + stop-loss (stop_limit)
+# - Handles partial fills safely (NO more "insufficient balance" on stops)
 # =========================================================
 
 # -------------------------
@@ -30,8 +30,8 @@ def must_env(name: str) -> str:
 
 ALPACA_API_KEY_ID = must_env("ALPACA_API_KEY_ID")
 ALPACA_API_SECRET_KEY = must_env("ALPACA_API_SECRET_KEY")
-
 ALPACA_ENV = os.getenv("ALPACA_ENV", "paper").strip().lower()
+
 ALPACA_BASE_URL = "https://paper-api.alpaca.markets" if ALPACA_ENV == "paper" else "https://api.alpaca.markets"
 alpaca = REST(ALPACA_API_KEY_ID, ALPACA_API_SECRET_KEY, ALPACA_BASE_URL)
 
@@ -43,24 +43,21 @@ app = Flask(__name__)
 ALLOWED_BASES = {"BTC", "ETH", "SOL"}
 
 # -------------------------
-# Risk / execution controls
+# Sizing & execution controls
 # -------------------------
-MAX_NOTIONAL = float(os.getenv("MAX_POSITION_DOLLARS", "20000"))
+MAX_POSITION_DOLLARS = float(os.getenv("MAX_POSITION_DOLLARS", "5000"))  # start conservative
+MAX_IOC_SLIP_PCT = float(os.getenv("MAX_IOC_SLIP_PCT", "0.0015"))        # 0.15%
+COOLDOWN_SECONDS = int(os.getenv("COOLDOWN_SECONDS", "60"))
+TV_PRICE_MAX_DEV = float(os.getenv("TV_PRICE_MAX_DEV", "0.0025"))        # 0.25%
 
-# Your requested protections
-MAX_IOC_SLIP_PCT = 0.0015      # 0.15%
-COOLDOWN_SECONDS = 60
-TV_PRICE_MAX_DEV = 0.0025      # 0.25%
-
-# Exit model (scalper-ish defaults)
-TP1_PCT = float(os.getenv("TP1_PCT", "0.006"))     # +0.6%
-TP2_PCT = float(os.getenv("TP2_PCT", "0.012"))     # +1.2%
-SL_PCT  = float(os.getenv("SL_PCT",  "0.009"))     # -0.9%
-STOP_LIMIT_SLIP = float(os.getenv("STOP_LIMIT_SLIP_PCT", "0.0015"))  # 0.15%
+# Exits (tuned for 1m)
+TP1_PCT = float(os.getenv("TP1_PCT", "0.006"))           # +0.6%
+TP2_PCT = float(os.getenv("TP2_PCT", "0.012"))           # +1.2%
+SL_PCT  = float(os.getenv("SL_PCT",  "0.009"))           # -0.9%
+STOP_LIMIT_SLIP_PCT = float(os.getenv("STOP_LIMIT_SLIP_PCT", "0.0015")) # 0.15%
 
 TP1_FRAC = float(os.getenv("TP1_FRAC", "0.40"))
 TP2_FRAC = float(os.getenv("TP2_FRAC", "0.40"))
-# runner remainder = 1 - TP1_FRAC - TP2_FRAC
 
 # Daily governors
 DAILY_PROFIT_STOP  = float(os.getenv("DAILY_PROFIT_STOP", "1100"))
@@ -78,9 +75,8 @@ STATE = {
     "trades": 0,
     "losers": 0,
 }
-LAST_BUY_TS = {}    # pair -> epoch seconds
-EXIT_ORDERS = {}    # pair -> {"tp1":id,"tp2":id,"sl":id}
-
+LAST_BUY_TS = {}   # pair -> epoch seconds
+EXIT_ORDERS = {}   # pair -> {"tp1":id,"tp2":id,"sl":id}
 
 # =========================================================
 # Helpers
@@ -88,9 +84,16 @@ EXIT_ORDERS = {}    # pair -> {"tp1":id,"tp2":id,"sl":id}
 def utc_day_key() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%d")
 
+def get_account():
+    return alpaca.get_account()
+
 def get_equity() -> float:
-    a = alpaca.get_account()
-    return float(a.equity)
+    return float(get_account().equity)
+
+def get_cash() -> float:
+    # For paper accounts, cash usually reflects what you can deploy.
+    # Crypto buying power behavior can vary; we still cap by cash as a safety.
+    return float(get_account().cash)
 
 def reset_day_if_needed():
     k = utc_day_key()
@@ -133,7 +136,7 @@ def enforce_daily_governors():
 
 def normalize(tv_symbol: str) -> str:
     """
-    Accepts: BTCUSD, BINANCE:SOLUSDT, BTC/USD, etc.
+    Accepts: BTCUSD, COINBASE:BTCUSD, BINANCE:SOLUSDT, BTC/USD, etc.
     Returns: BTC/USD, SOL/USDT, etc.
     """
     s = (tv_symbol or "").upper().strip()
@@ -156,29 +159,21 @@ def asset_sym(pair: str) -> str:
     return pair.replace("/", "")
 
 def get_qty(pair: str) -> float:
-    # Positions usually referenced as BTCUSD / ETHUSD / SOLUSD / SOLUSDT etc.
     try:
         return float(alpaca.get_position(asset_sym(pair)).qty)
     except Exception:
         return 0.0
 
 def r(p: float) -> float:
-    return round(p, 8 if p < 1 else 4)
+    return round(p, 8 if p < 1 else 6)
 
 def too_far_from_tv(cur: float, tv: float) -> bool:
     return abs(cur - tv) / tv > TV_PRICE_MAX_DEV
 
-
 # =========================================================
-# Reliable Crypto Price via Alpaca Data API
+# Reliable crypto price (Alpaca Data API v1beta3)
 # =========================================================
 def get_crypto_price(pair: str) -> float | None:
-    """
-    Uses Alpaca Data API v1beta3 crypto latest trades.
-    Example:
-      https://data.alpaca.markets/v1beta3/crypto/us/latest/trades?symbols=BTC/USD
-    Returns last trade price or None.
-    """
     try:
         url = "https://data.alpaca.markets/v1beta3/crypto/us/latest/trades"
         headers = {
@@ -191,11 +186,9 @@ def get_crypto_price(pair: str) -> float | None:
         t = (j.get("trades") or {}).get(pair)
         if not t:
             return None
-        # Alpaca returns price as "p"
         return float(t["p"])
     except Exception:
         return None
-
 
 # =========================================================
 # Order helpers
@@ -217,6 +210,11 @@ def cleanup_if_flat(pair: str):
     if get_qty(pair) <= 0:
         cancel_exits(pair)
 
+def safe_notional_cap() -> float:
+    # Keep it conservative relative to cash; avoids “insufficient balance” paths.
+    cash = get_cash()
+    return max(0.0, min(MAX_POSITION_DOLLARS, cash * 0.95))
+
 def marketable_ioc_limit_buy(pair: str, notional: float, cur_price: float) -> dict:
     qty = notional / cur_price
     limit_price = r(cur_price * (1 + MAX_IOC_SLIP_PCT))
@@ -228,7 +226,7 @@ def marketable_ioc_limit_buy(pair: str, notional: float, cur_price: float) -> di
         qty=r(qty),
         limit_price=limit_price,
     )
-    return {"qty_req": qty, "limit": limit_price}
+    return {"notional": notional, "qty_req": qty, "limit": limit_price}
 
 def marketable_ioc_limit_sell(pair: str, qty: float, cur_price: float) -> dict:
     limit_price = r(cur_price * (1 - MAX_IOC_SLIP_PCT))
@@ -243,30 +241,63 @@ def marketable_ioc_limit_sell(pair: str, qty: float, cur_price: float) -> dict:
     return {"limit": limit_price}
 
 def place_take_profits(pair: str, qty: float, ref_price: float):
-    tp1_qty = r(qty * TP1_FRAC)
-    tp2_qty = r(qty * TP2_FRAC)
+    """
+    Places TP1 and TP2 sized off *current* qty.
+    If qty is tiny (partial fill dust), skip TPs and rely on stop.
+    """
+    if qty <= 0:
+        return
+
+    # Avoid rounding pushing totals over qty
+    tp1_qty = max(0.0, float(qty) * TP1_FRAC)
+    tp2_qty = max(0.0, float(qty) * TP2_FRAC)
+
+    # If partial fill is small, TPs may be too tiny to be meaningful
+    if tp1_qty <= 0 or tp2_qty <= 0:
+        return
+
+    # Ensure sum(tp1,tp2) <= qty
+    if tp1_qty + tp2_qty > qty:
+        scale = qty / (tp1_qty + tp2_qty)
+        tp1_qty *= scale
+        tp2_qty *= scale
 
     tp1_price = r(ref_price * (1 + TP1_PCT))
     tp2_price = r(ref_price * (1 + TP2_PCT))
 
     o1 = alpaca.submit_order(
-        symbol=pair, side="sell", type="limit", time_in_force="gtc",
-        qty=tp1_qty, limit_price=tp1_price
+        symbol=pair,
+        side="sell",
+        type="limit",
+        time_in_force="gtc",
+        qty=r(tp1_qty),
+        limit_price=tp1_price,
     )
     o2 = alpaca.submit_order(
-        symbol=pair, side="sell", type="limit", time_in_force="gtc",
-        qty=tp2_qty, limit_price=tp2_price
+        symbol=pair,
+        side="sell",
+        type="limit",
+        time_in_force="gtc",
+        qty=r(tp2_qty),
+        limit_price=tp2_price,
     )
     EXIT_ORDERS.setdefault(pair, {})["tp1"] = o1.id
     EXIT_ORDERS.setdefault(pair, {})["tp2"] = o2.id
 
 def place_or_replace_stop(pair: str, qty: float, ref_price: float):
+    """
+    Always size stop to the *actual current position qty* to avoid
+    'insufficient balance' errors after partial fills / TP fills.
+    """
+    if qty <= 0:
+        return
+
     ids = EXIT_ORDERS.get(pair, {})
     if "sl" in ids:
         cancel_order(ids["sl"])
 
     stop_price = r(ref_price * (1 - SL_PCT))
-    limit_price = r(stop_price * (1 - STOP_LIMIT_SLIP))
+    limit_price = r(stop_price * (1 - STOP_LIMIT_SLIP_PCT))
 
     o = alpaca.submit_order(
         symbol=pair,
@@ -279,9 +310,10 @@ def place_or_replace_stop(pair: str, qty: float, ref_price: float):
     )
     EXIT_ORDERS.setdefault(pair, {})["sl"] = o.id
 
-
 # =========================================================
-# Reconciler (keeps stop qty correct after partial fills)
+# Background reconciler
+# Keeps stop order qty aligned with remaining position qty
+# (and never crashes your service)
 # =========================================================
 def reconcile_loop():
     while True:
@@ -292,16 +324,18 @@ def reconcile_loop():
                     cancel_exits(pair)
                     continue
 
-                # refresh stop with remaining qty
                 ref = get_crypto_price(pair)
                 if ref:
-                    place_or_replace_stop(pair, q, ref)
+                    try:
+                        place_or_replace_stop(pair, q, ref)
+                    except Exception:
+                        # don't kill loop; try again next cycle
+                        pass
         except Exception:
             pass
         time.sleep(8)
 
 threading.Thread(target=reconcile_loop, daemon=True).start()
-
 
 # =========================================================
 # Actions
@@ -322,35 +356,60 @@ def do_buy(pair: str, tv_price: float | None) -> dict:
     if get_qty(pair) > 0:
         return {"status": "skipped", "reason": "already_long"}
 
-    # Get live price; fallback to tv_price
     cur = get_crypto_price(pair) or tv_price
     if not cur:
         return {"status": "error", "reason": "no_current_price"}
 
-    if tv_price and tv_price > 0:
-        if too_far_from_tv(cur, tv_price):
-            return {"status": "skipped", "reason": "tv_price_deviation", "current": cur, "tv_price": tv_price, "max_dev": TV_PRICE_MAX_DEV}
+    if tv_price and tv_price > 0 and too_far_from_tv(cur, tv_price):
+        return {
+            "status": "skipped",
+            "reason": "tv_price_deviation",
+            "current": cur,
+            "tv_price": tv_price,
+            "max_dev": TV_PRICE_MAX_DEV,
+        }
 
     cleanup_if_flat(pair)
     cancel_exits(pair)
 
-    entry = marketable_ioc_limit_buy(pair, MAX_NOTIONAL, cur)
+    notional = safe_notional_cap()
+    if notional <= 0:
+        return {"status": "error", "reason": "no_cash_available", "cash": get_cash()}
+
+    entry = marketable_ioc_limit_buy(pair, notional, cur)
     LAST_BUY_TS[pair] = now
     STATE["trades"] += 1
 
-    # Wait briefly for position to appear, then place exits
-    q = 0.0
-    ref = None
-    for _ in range(10):  # ~2s
+    # Wait for actual filled position qty; then place exits using ONLY that qty
+    ref = get_crypto_price(pair) or tv_price or cur
+    for _ in range(14):  # ~2.8s
         time.sleep(0.2)
         q = get_qty(pair)
-        ref = get_crypto_price(pair) or tv_price
-        if q > 0 and ref:
-            place_take_profits(pair, q, ref)
-            place_or_replace_stop(pair, q, ref)
-            return {"status": "bought", "entry": entry, "qty": q, "ref_price": ref, "guards": info}
+        if q > 0:
+            # Place TPs and STOP with the real qty. If partial fill, this still works.
+            try:
+                place_take_profits(pair, q, ref)
+            except Exception:
+                # If TP placement fails, continue; stop still protects
+                pass
 
-    return {"status": "buy_sent_no_exits_yet", "entry": entry, "guards": info}
+            # Stop must always be placed to current qty; retry once with refreshed qty
+            try:
+                q_now = get_qty(pair)
+                ref_now = get_crypto_price(pair) or ref
+                place_or_replace_stop(pair, q_now, ref_now)
+            except Exception:
+                try:
+                    q_now = get_qty(pair)
+                    ref_now = get_crypto_price(pair) or ref
+                    if q_now > 0:
+                        place_or_replace_stop(pair, q_now, ref_now)
+                except Exception:
+                    pass
+
+            return {"status": "bought", "entry": entry, "qty": get_qty(pair), "ref_price": ref, "guards": info}
+
+    return {"status": "buy_sent_no_position_visible_yet", "entry": entry, "guards": info}
 
 def do_sell(pair: str, tv_price: float | None) -> dict:
     cleanup_if_flat(pair)
@@ -369,7 +428,6 @@ def do_sell(pair: str, tv_price: float | None) -> dict:
     res = marketable_ioc_limit_sell(pair, q, cur)
     return {"status": "sold", "qty": q, "exit": res}
 
-
 # =========================================================
 # Routes
 # =========================================================
@@ -380,7 +438,9 @@ def health():
         "status": "ok",
         "env": ALPACA_ENV,
         "allowed": sorted(ALLOWED_BASES),
-        "max_notional": MAX_NOTIONAL,
+        "max_position_dollars": MAX_POSITION_DOLLARS,
+        "cash": get_cash(),
+        "equity": get_equity(),
         "pnl": daily_pnl(),
         "disabled": STATE["disabled"],
         "trades": STATE["trades"],
@@ -400,7 +460,6 @@ def webhook():
         if not ticker or signal not in ("BUY", "SELL"):
             return jsonify({"ok": False, "error": "Bad payload. Need {ticker, signal: BUY|SELL, tv_price(optional)}"}), 400
 
-        # Reject unsubstituted placeholders
         t = str(ticker)
         if "{{" in t or "}}" in t:
             return jsonify({"ok": False, "error": "Unsubstituted ticker placeholder. Use {{ticker}}."}), 400
